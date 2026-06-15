@@ -80,8 +80,12 @@ async function init() {
       indexURL: `https://cdn.jsdelivr.net/pyodide/${PYODIDE_VERSION}/full/`,
     });
 
-    busy("Loading data libraries (pandas, matplotlib, openpyxl)…");
-    await pyodide.loadPackage(["pandas", "numpy", "matplotlib", "openpyxl", "Pillow"]);
+    busy("Loading data libraries (pandas, matplotlib)…");
+    await pyodide.loadPackage(["pandas", "numpy", "matplotlib", "Pillow", "micropip"]);
+
+    busy("Installing openpyxl…");
+    const micropip = pyodide.pyimport("micropip");
+    await micropip.install("openpyxl");
 
     busy("Loading the analysis script…");
     const code = await (await fetch("edtech_analyzer.py")).text();
