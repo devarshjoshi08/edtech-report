@@ -165,18 +165,186 @@ def generate_demo_data(curr_path, prev_path=None):
     return curr_path, prev_path
 
 
+SCHOOL_ID_COL = "schoolCode"
+
+
+def count_schools(df):
+    """Number of distinct schools, counted by schoolCode.
+
+    School NAMES are not unique in the source data — different schools can share
+    a name (e.g. two separate 'GSSS Kotla'). schoolCode is unique by design, so
+    it is the only safe key to count on. Falls back to name only if the file has
+    no schoolCode column at all.
+    """
+    if df is None:
+        return 0
+    if SCHOOL_ID_COL in df.columns:
+        return int(df[SCHOOL_ID_COL].nunique())
+    return int(df["s.name"].nunique())
+
+
+def resolve_school_identity(df):
+    """Make 's.name' a 1:1 label for schoolCode.
+
+    Where a single school name is shared by more than one schoolCode, the code is
+    appended to the name (e.g. 'GSSS Kotla (333801)'). This keeps every existing
+    per-school grouping, ranking and chart aligned with the schoolCode-based
+    count, instead of silently merging distinct schools that share a name.
+    """
+    if SCHOOL_ID_COL not in df.columns or "s.name" not in df.columns:
+        return df
+
+    df[SCHOOL_ID_COL] = df[SCHOOL_ID_COL].astype(str).str.strip()
+    df["s.name"] = df["s.name"].astype(str).str.strip()
+
+    codes_per_name = df.groupby("s.name")[SCHOOL_ID_COL].transform("nunique")
+    ambiguous = codes_per_name > 1
+
+    if ambiguous.any():
+        affected = sorted(df.loc[ambiguous, "s.name"].unique())
+        df.loc[ambiguous, "s.name"] = (
+            df.loc[ambiguous, "s.name"] + " (" + df.loc[ambiguous, SCHOOL_ID_COL] + ")"
+        )
+        print(f"   ℹ️  {len(affected)} school name(s) shared by multiple schoolCodes — "
+              f"disambiguated with code: {', '.join(affected[:5])}"
+              f"{' ...' if len(affected) > 5 else ''}")
+
+    return df
+
+
+# ─── Total vs Quality Usage ──────────────────────────────────────────────────
+# "Total Usage"   = session time — how long the student sat inside the app.
+# "Quality Usage" = question-level time — time actually spent attempting questions.
+# The difference between the two is idle / non-question time: navigation, videos,
+# menus, or a session left open. A small gap means a focused learner; a large gap
+# means logged-in time is not converting into practice.
+
+QUALITY_COL = "Quality Usage"
+
+
+def has_quality_usage(df):
+    """True only if the file carries a usable Quality Usage column."""
+    return (
+        df is not None
+        and QUALITY_COL in df.columns
+        and pd.to_numeric(df[QUALITY_COL], errors="coerce").fillna(0).sum() > 0
+    )
+
+
+def prepare_quality_usage(df):
+    """Clamp Quality Usage to Total Usage and derive the gap column.
+
+    A handful of source rows report Quality > Total (upstream rounding/logging
+    quirk). Those would produce a negative gap, so quality is capped at total —
+    the count of affected rows is printed rather than silently swallowed.
+    """
+    if QUALITY_COL not in df.columns or "Total Usage" not in df.columns:
+        return df
+
+    df[QUALITY_COL] = pd.to_numeric(df[QUALITY_COL], errors="coerce").fillna(0)
+    over = int((df[QUALITY_COL] > df["Total Usage"]).sum())
+    if over:
+        print(f"   ℹ️  {over} row(s) had Quality Usage > Total Usage — capped at Total.")
+        df[QUALITY_COL] = df[[QUALITY_COL, "Total Usage"]].min(axis=1)
+    df["Usage Gap"] = (df["Total Usage"] - df[QUALITY_COL]).clip(lower=0)
+    return df
+
+
+def usage_gap_summary(df, key):
+    """Aggregate the total-vs-quality usage gap by any grouping column.
+
+    Only students with Total Usage > 0 are counted — a student who never opened
+    the app has no gap to explain and would otherwise drag every average down.
+    Ratios are computed on summed minutes (not the mean of per-student ratios),
+    so a state's number reflects its actual minute pool.
+    """
+    if not has_quality_usage(df) or key not in df.columns:
+        return pd.DataFrame()
+
+    used = df[df["Total Usage"] > 0].copy()
+    if used.empty:
+        return pd.DataFrame()
+
+    g = used.groupby(key, dropna=False).agg(
+        students=("username", "count"),
+        total_min=("Total Usage", "sum"),
+        quality_min=(QUALITY_COL, "sum"),
+        gap_min=("Usage Gap", "sum"),
+    ).reset_index()
+    g = g.rename(columns={key: "label"})
+    g["label"] = g["label"].fillna("Unspecified").astype(str)
+
+    g["avg_total"]   = (g["total_min"]   / g["students"]).round(1)
+    g["avg_quality"] = (g["quality_min"] / g["students"]).round(1)
+    g["avg_gap"]     = (g["gap_min"]     / g["students"]).round(1)
+    g["quality_pct"] = (g["quality_min"] / g["total_min"].replace(0, np.nan) * 100).round(1).fillna(0)
+    g["gap_pct"]     = (100 - g["quality_pct"]).round(1)
+    return g.sort_values("quality_pct", ascending=False).reset_index(drop=True)
+
+
+def overall_quality_stats(df):
+    """Headline total-vs-quality numbers across the whole dataset."""
+    if not has_quality_usage(df):
+        return None
+    used = df[df["Total Usage"] > 0]
+    if used.empty:
+        return None
+    total = float(used["Total Usage"].sum())
+    quality = float(used[QUALITY_COL].sum())
+    return {
+        "engaged_students": int(len(used)),
+        "total_min": total,
+        "quality_min": quality,
+        "gap_min": total - quality,
+        "quality_pct": round(quality / total * 100, 1) if total else 0.0,
+        "gap_pct": round((total - quality) / total * 100, 1) if total else 0.0,
+        "avg_total": round(total / len(used), 1),
+        "avg_quality": round(quality / len(used), 1),
+        "avg_gap": round((total - quality) / len(used), 1),
+    }
+
+
 def load_data(path):
     df = pd.read_excel(path)
     df.columns = df.columns.str.strip()
     # Normalize numeric cols
     num_cols = ["Language", "english", "Math", "FLN", "CT",
-                "Total Usage", "Language_weekly", "English_weekly",
+                "Total Usage", "Quality Usage", "Language_weekly", "English_weekly",
                 "Math_weekly", "CT_Weekly", "Weekly Usage",
                 "Lang PreciseLevel", "English PreciseLevel", "Math Precise Level"]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df = resolve_school_identity(df)
+    df = prepare_quality_usage(df)
     return df
+
+
+# Coverage recorded BEFORE week-on-week matching narrows the population.
+# In compare mode the report is computed on students present in both weeks, so
+# its school/district/student counts are a subset of the full file. We keep the
+# full-file figures here so the report can show both numbers side by side.
+FULL_COVERAGE = {}
+
+
+def set_full_coverage(df):
+    """Record full-file coverage before any week-on-week matching is applied."""
+    FULL_COVERAGE.clear()
+    FULL_COVERAGE.update({
+        "schools": count_schools(df),
+        "students": len(df),
+        "districts": int(df["district"].nunique()) if "district" in df.columns else 0,
+    })
+    return FULL_COVERAGE
+
+
+def schools_coverage_label(df):
+    """'4,025' in current mode, '4,025 (4,016 matched WoW)' in compare mode."""
+    matched = count_schools(df)
+    total = FULL_COVERAGE.get("schools")
+    if not total or total == matched:
+        return f"{matched:,}"
+    return f"{total:,} ({matched:,} matched WoW)"
 
 
 def filter_common_students(curr_df, prev_df):
@@ -198,6 +366,9 @@ def filter_common_students(curr_df, prev_df):
     print(f"   ℹ️  Common students in both weeks: {len(common)} "
           f"(current had {len(curr_df)}, previous had {len(prev_df)} — "
           f"{len(curr_df) - len(curr_common)} / {len(prev_df) - len(prev_common)} dropped)")
+    print(f"   ℹ️  Schools: {count_schools(curr_df)} in full file → "
+          f"{count_schools(curr_common)} with matched week-on-week data "
+          f"({count_schools(curr_df) - count_schools(curr_common)} have no comparable students)")
 
     return curr_common, prev_common
 
@@ -221,11 +392,19 @@ def compute_kpis(df):
         "avg_weekly_usage": round(df["Weekly Usage"].mean(), 1),
         "avg_total_usage": round(df["Total Usage"].mean(), 1),
         "districts": df["district"].nunique(),
-        "schools": df["s.name"].nunique(),
+        # Counted by schoolCode — school names are not unique. See count_schools().
+        "schools": count_schools(df),
+        "schools_total": FULL_COVERAGE.get("schools") or count_schools(df),
+        "schools_label": schools_coverage_label(df),
         "projects": df["Project Name"].nunique(),
     }
     if has_english(df):
         kpis["avg_english_level"] = round(df["English PreciseLevel"].mean(), 2)
+    q = overall_quality_stats(df)
+    if q:
+        kpis["avg_quality_usage"] = q["avg_quality"]
+        kpis["avg_usage_gap"]     = q["avg_gap"]
+        kpis["quality_pct"]       = q["quality_pct"]
     return kpis
 
 
@@ -283,15 +462,16 @@ def find_red_flags(df, prev_df=None):
             "detail": f"{low_math} students ({low_math/len(df)*100:.1f}%) are below Level 3 in Math. Needs targeted intervention.",
         })
 
-    # Students with zero English usage but not zero total (only if school has English)
-    if has_english(df):
-        no_eng = ((df["english"] == 0) & (df["Total Usage"] > 1000)).sum()
-        if no_eng > 50:
-            flags.append({
-                "level": "info",
-                "title": "ℹ️ No English Engagement",
-                "detail": f"{no_eng} active students have zero English usage. Consider promoting English content.",
-            })
+    # Session time that never turns into question attempts
+    q = overall_quality_stats(df)
+    if q and q["quality_pct"] < 40:
+        flags.append({
+            "level": "critical" if q["quality_pct"] < 25 else "warning",
+            "title": "⏱️ Low Quality-Usage Share",
+            "detail": (f"Only {q['quality_pct']:.1f}% of session time is question-level (quality) usage — "
+                       f"{q['avg_gap']:.0f} of every {q['avg_total']:.0f} min per engaged student is "
+                       f"non-question time. Target is 40%+."),
+        })
 
     # WoW drops (if prev data)
     if prev_df is not None:
@@ -771,6 +951,16 @@ def generate_mail_body(kpis, deltas, flags, df, report_date):
         for f in flags:
             flag_lines += f"• {f['title']}: {f['detail']}\n"
 
+    q_stats = overall_quality_stats(df)
+    quality_lines = ""
+    if q_stats:
+        quality_lines = (
+            f"\n• Avg Quality Usage         : {q_stats['avg_quality']:.0f} min "
+            f"(question-level time)\n"
+            f"• Total ↔ Quality Gap       : {q_stats['avg_gap']:.0f} min per engaged student "
+            f"— only {q_stats['quality_pct']:.1f}% of session time is question time\n"
+        )
+
     top_schools = "\n".join(
         f"  {i+1}. {r['s.name']}: {r['weekly']:.0f} min/week ({r['activation']:.0f}% active)"
         for i, (_, r) in enumerate(top3.iterrows())
@@ -794,10 +984,10 @@ Please find below the weekly EdTech usage summary for the week ending {report_da
 • Inactive Students         : {kpis['inactive_students']} ({100-rate:.1f}%)
 
 • Avg Weekly Usage          : {kpis['avg_weekly_usage']} min{delta_str('avg_weekly_usage')}
-• Avg Total Usage (cumul.)  : {kpis['avg_total_usage']} min
+• Avg Total Usage (cumul.)  : {kpis['avg_total_usage']} min{quality_lines}
 
 • Districts Covered         : {kpis['districts']}
-• Schools Covered           : {kpis['schools']}
+• Schools Covered           : {kpis['schools_label']}
 {flag_lines}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📚 PROFICIENCY LEVELS (Avg)
@@ -828,13 +1018,17 @@ EdTech Analytics Team"""
 
 # ─── HTML Report Builder ─────────────────────────────────────────────────────
 
-def kpi_card(label, value, delta=None, unit="", suffix="", is_bad=False):
+def kpi_card(label, value, delta=None, unit="", suffix="", is_bad=False, note=""):
     delta_html = ""
     if delta is not None:
         color = COLORS["success"] if delta >= 0 else COLORS["danger"]
         arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "→")
         sign = "+" if delta > 0 else ""
         delta_html = f'<span style="color:{color};font-size:12px;display:block;margin-top:4px">{arrow} {sign}{delta} WoW</span>'
+
+    if note:
+        delta_html += (f'<span style="color:{COLORS["muted"]};font-size:11px;display:block;'
+                       f'margin-top:4px">{note}</span>')
 
     bg = "#fff5f5" if is_bad else "white"
     border = f"3px solid {COLORS['danger']}" if is_bad else f"1px solid #e8ecf0"
@@ -927,6 +1121,8 @@ def build_html_report(curr_df, prev_df, report_date, output_path):
     chart_proj = chart_project_wow(curr_df, prev_df)
     chart_state_wow  = chart_wow_comparison(curr_df, prev_df) if _has_prev else None
     chart_dist_wow   = chart_district_wow(curr_df, prev_df)   if _has_prev else None
+    chart_gap_state   = chart_usage_gap_state(curr_df)
+    chart_gap_project = chart_usage_gap_project(curr_df)
 
     def d(key):
         return deltas.get(key) if deltas else None
@@ -1120,7 +1316,7 @@ function dlSection(btn, name) {{
   <h1>📊 EdTech Weekly Analytics Report</h1>
   <p>Report Date: <strong>{report_date}</strong> &nbsp;|&nbsp;
      Data: <strong>{len(curr_df):,} students</strong> across
-     <strong>{curr_df["s.name"].nunique()} schools</strong> &amp;
+     <strong>{schools_coverage_label(curr_df)} schools</strong> &amp;
      <strong>{curr_df["district"].nunique()} districts</strong>
      {' &nbsp;|&nbsp; ▸ WoW comparison enabled' if prev_df is not None else ''}
   </p>
@@ -1144,7 +1340,13 @@ function dlSection(btn, name) {{
                 is_bad=kpis["inactive_students"] > kpis["total_students"] * 0.4)}
       {kpi_card("Avg Weekly Usage",  kpis["avg_weekly_usage"],  d("avg_weekly_usage"),  suffix=" min")}
       {kpi_card("Avg Total Usage",   kpis["avg_total_usage"],   d("avg_total_usage"),   suffix=" min")}
-      {kpi_card("Schools",           kpis["schools"])}
+      {kpi_card("Avg Quality Usage", kpis.get("avg_quality_usage", 0), d("avg_quality_usage"), suffix=" min",
+                note="Question-level time / engaged student") if "avg_quality_usage" in kpis else ""}
+      {kpi_card("Usage Gap", kpis.get("avg_usage_gap", 0), d("avg_usage_gap"), suffix=" min", is_bad=True,
+                note=f"{kpis.get('quality_pct', 0)}% of session time is quality") if "avg_usage_gap" in kpis else ""}
+      {kpi_card("Schools Covered",   kpis["schools_total"],
+                note=(f'{kpis["schools"]:,} with matched WoW data'
+                      if kpis["schools_total"] != kpis["schools"] else ""))}
       {kpi_card("Districts",         kpis["districts"])}
       {kpi_card("Projects",          kpis["projects"])}
     </div>
@@ -1169,6 +1371,27 @@ function dlSection(btn, name) {{
       <button class="dl-btn" onclick="dlSection(this,'Project_WoW')">⬇ Save as JPG</button>
     </div>
     {wrap_chart_html(chart_proj, 'project_wow.jpg')}
+  </div>
+
+  <div class="section full">
+    <div class="section-hdr">
+      <h2>⏱️ Total vs Quality Usage Gap — by State</h2>
+      <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_State')">⬇ Save as JPG</button>
+    </div>
+    <div style="font-size:13px;color:{COLORS['muted']};margin-bottom:10px">
+      <b>Total Usage</b> is session time (how long the student was inside the app).
+      <b>Quality Usage</b> is question-level time (time actually spent attempting questions).
+      The red band is the gap — logged-in time that did not convert into practice.
+    </div>
+    {wrap_chart_html(chart_gap_state, 'usage_gap_state.jpg')}
+  </div>
+
+  <div class="section full">
+    <div class="section-hdr">
+      <h2>📁 Total vs Quality Usage Gap — by Project</h2>
+      <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_Project')">⬇ Save as JPG</button>
+    </div>
+    {wrap_chart_html(chart_gap_project, 'usage_gap_project.jpg')}
   </div>
 
   {dist_wow_section}
@@ -1222,6 +1445,76 @@ function dlSection(btn, name) {{
 
 
 # ─── Excel Summary Export ─────────────────────────────────────────────────────
+
+def _write_usage_gap_sheet(wb, df, report_date, styles):
+    """Add a 'Usage Quality Gap' sheet: state-level then project-level blocks."""
+    if not has_quality_usage(df):
+        return None
+
+    hdr, body_row, title_cell, auto_width = (
+        styles["hdr"], styles["body_row"], styles["title_cell"], styles["auto_width"])
+    G_FILL, R_FILL, W_FILL, SUB_FONT, LFT = (
+        styles["G_FILL"], styles["R_FILL"], styles["W_FILL"],
+        styles["SUB_FONT"], styles["LFT"])
+
+    ws = wb.create_sheet("Usage Quality Gap")
+    title_cell(ws, 1, 1, f"Total vs Quality Usage Gap — {report_date}", span_to=8)
+    ws.append([])
+
+    note = ("Total Usage = session time in the app. Quality Usage = question-level time "
+            "(time actually spent attempting questions). Gap = Total − Quality, i.e. "
+            "logged-in time that did not convert into practice. Averages are per engaged "
+            "student (Total Usage > 0); % figures are computed on summed minutes.")
+    ws.cell(2, 1, note).alignment = LFT
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
+    ws.row_dimensions[2].height = 46
+
+    overall = overall_quality_stats(df)
+    if overall:
+        ws.append(["Overall", f"{overall['engaged_students']:,} engaged students",
+                   f"Avg Total {overall['avg_total']:.1f} min",
+                   f"Avg Quality {overall['avg_quality']:.1f} min",
+                   f"Avg Gap {overall['avg_gap']:.1f} min",
+                   f"Quality Share {overall['quality_pct']:.1f}%",
+                   f"Gap Share {overall['gap_pct']:.1f}%", ""])
+        r = ws.max_row
+        body_row(ws, r, 8)
+        ws.cell(r, 1).font = SUB_FONT
+        for c in range(1, 8):
+            ws.cell(r, c).fill = W_FILL
+            ws.cell(r, c).alignment = LFT
+        ws.append([])
+
+    cols = ["Name", "Engaged Students", "Avg Total Usage (min)", "Avg Quality Usage (min)",
+            "Avg Gap (min)", "Quality Share %", "Gap Share %", "Total Gap (student-hours)"]
+
+    for label, key in [("🗺️ State-wise Usage Gap", "state"),
+                       ("📁 Project-wise Usage Gap", "Project Name")]:
+        g = usage_gap_summary(df, key)
+        if g.empty:
+            continue
+        ws.append([label]); r = ws.max_row
+        ws.cell(r, 1).font = SUB_FONT
+        ws.cell(r, 1).fill = styles["TITLE_FILL"]
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=8)
+
+        ws.append(cols); hdr(ws, ws.max_row, 8)
+        # worst conversion first — that is where follow-up is needed
+        for i, (_, row) in enumerate(g.sort_values("quality_pct").iterrows()):
+            ws.append([row["label"], int(row["students"]), row["avg_total"],
+                       row["avg_quality"], row["avg_gap"], row["quality_pct"],
+                       row["gap_pct"], round(row["gap_min"] / 60, 1)])
+            r2 = ws.max_row
+            body_row(ws, r2, 8, alt=(i % 2 == 0))
+            ws.cell(r2, 1).alignment = LFT
+            q_cell = ws.cell(r2, 6)
+            q_cell.fill = (G_FILL if row["quality_pct"] >= 50 else
+                           W_FILL if row["quality_pct"] >= 30 else R_FILL)
+        ws.append([])
+
+    auto_width(ws, mn=12, mx=44)
+    return ws
+
 
 def export_excel_summary(curr_df, prev_df, kpis, deltas, flags, report_date, output_path):
     from openpyxl import Workbook
@@ -1301,7 +1594,8 @@ def export_excel_summary(curr_df, prev_df, kpis, deltas, flags, report_date, out
         ("Avg Weekly Usage (min)",  kpis["avg_weekly_usage"],    prev_kpis.get("avg_weekly_usage"),    "avg_weekly_usage",    False),
         ("Avg Total Usage (min)",   kpis["avg_total_usage"],     prev_kpis.get("avg_total_usage"),     "avg_total_usage",     False),
         ("Districts Covered",       kpis["districts"],           prev_kpis.get("districts"),           "districts",           False),
-        ("Schools Covered",         kpis["schools"],             prev_kpis.get("schools"),             "schools",             False),
+        ("Schools Covered (total)",  kpis["schools_total"],      "N/A",                                None,                  False),
+        ("Schools Covered (matched WoW)", kpis["schools"],       prev_kpis.get("schools"),             "schools",             False),
         ("Projects",                kpis["projects"],            prev_kpis.get("projects"),            "projects",            False),
     ]
 
@@ -1327,7 +1621,7 @@ def export_excel_summary(curr_df, prev_df, kpis, deltas, flags, report_date, out
     level_fill = {"critical": R_FILL, "warning": W_FILL, "info": I_FILL}
     for i, f in enumerate(flags):
         ws2.append([f["level"].upper(), f["title"].replace("🚨","").replace("⚠️","")
-                    .replace("📉","").replace("👥","").replace("ℹ️","").strip(),
+                    .replace("📉","").replace("👥","").replace("ℹ️","").replace("⏱️","").strip(),
                     f["detail"]])
         r = 4 + i; body_row(ws2, r, 3, alt=False)
         ws2.cell(r, 1).fill = level_fill.get(f["level"], A_FILL)
@@ -1462,6 +1756,14 @@ def export_excel_summary(curr_df, prev_df, kpis, deltas, flags, report_date, out
     auto_width(ws5)
 
     # ── Sheet 6: Email Body ───────────────────────────────────────────────────
+    _gap_styles = {
+        "hdr": hdr, "body_row": body_row, "title_cell": title_cell,
+        "auto_width": auto_width, "G_FILL": G_FILL, "R_FILL": R_FILL,
+        "W_FILL": W_FILL, "SUB_FONT": SUB_FONT, "LFT": LFT,
+        "TITLE_FILL": PatternFill("solid", fgColor="F0F4F8"),
+    }
+    _write_usage_gap_sheet(wb, curr_df, report_date, _gap_styles)
+
     ws6 = wb.create_sheet("Email Body")
     mail = generate_mail_body(kpis, deltas, flags, curr_df, report_date)
     title_cell(ws6, 1, 1, "Ready-to-Copy Email Body", span_to=2)
@@ -1503,6 +1805,51 @@ def generate_current_week_insights(df):
                    f"Activation rate: {activation_rate:.1f}%."),
         "level": "info",
     })
+
+    # 1b. Total vs Quality usage gap (session time vs question-level time)
+    q = overall_quality_stats(df)
+    if q:
+        insights.append({
+            "title": "⏱️ Total vs Quality Usage Gap",
+            "detail": (f"Across {q['engaged_students']:,} engaged students, "
+                       f"{q['avg_total']:.0f} min of session time per student yields only "
+                       f"{q['avg_quality']:.0f} min of question-level (quality) usage — a gap of "
+                       f"{q['avg_gap']:.0f} min ({q['gap_pct']:.1f}% of time in app). "
+                       f"Quality share overall: {q['quality_pct']:.1f}%."),
+            "level": "info",
+        })
+
+        st = usage_gap_summary(df, "state")
+        st = st[st["students"] >= 500] if (st["students"] >= 500).sum() >= 2 else st
+        if len(st) >= 2:
+            best, worst = st.iloc[0], st.iloc[-1]
+            insights.append({
+                "title": "🗺️ Usage Gap by State",
+                "detail": (f"'{best['label']}' converts best — {best['quality_pct']:.1f}% of session time is "
+                           f"question time (gap {best['avg_gap']:.0f} min/student). "
+                           f"'{worst['label']}' converts worst — {worst['quality_pct']:.1f}% quality, "
+                           f"gap {worst['avg_gap']:.0f} min/student across {int(worst['students']):,} students. "
+                           f"Spread: {best['quality_pct'] - worst['quality_pct']:.1f} pp "
+                           f"(states with 500+ engaged students)."),
+                "level": "info",
+            })
+
+        pr = usage_gap_summary(df, "Project Name")
+        pr = pr[pr["students"] >= 200] if (pr["students"] >= 200).sum() >= 2 else pr
+        if len(pr) >= 2:
+            best, worst = pr.iloc[0], pr.iloc[-1]
+            big_gap = pr.nlargest(1, "gap_min").iloc[0]
+            insights.append({
+                "title": "📁 Usage Gap by Project",
+                "detail": (f"Best conversion: '{best['label']}' at {best['quality_pct']:.1f}% quality "
+                           f"(gap {best['avg_gap']:.0f} min/student). "
+                           f"Weakest: '{worst['label']}' at {worst['quality_pct']:.1f}% quality "
+                           f"(gap {worst['avg_gap']:.0f} min/student). "
+                           f"Largest absolute gap pool: '{big_gap['label']}' with "
+                           f"{big_gap['gap_min']/60:,.0f} student-hours of non-question time "
+                           f"(projects with 200+ engaged students)."),
+                "level": "info",
+            })
 
     # 2. Most-engaged subject
     subj_avg = {
@@ -1595,6 +1942,61 @@ def generate_current_week_insights(df):
             })
 
     return insights
+
+
+def chart_usage_gap(df, key, title, max_items=18):
+    """Stacked bar: quality (question) minutes vs idle gap minutes per student.
+
+    Bars are sorted worst-first (lowest quality share at the top) so the groups
+    that need follow-up are read first. The % label is the quality share of
+    session time, i.e. how much of the time in the app became actual practice.
+    """
+    g = usage_gap_summary(df, key)
+    if g.empty:
+        return None
+
+    g = g.sort_values("quality_pct", ascending=True)
+    if len(g) > max_items:
+        g = pd.concat([g.head(max_items // 2), g.tail(max_items - max_items // 2)])
+    g = g.sort_values("quality_pct", ascending=True).reset_index(drop=True)
+
+    n = len(g)
+    fig, ax = plt.subplots(figsize=(13, max(4.5, 0.46 * n + 2)))
+    y = np.arange(n)
+
+    ax.barh(y, g["avg_quality"], color=COLORS["success"], height=0.62,
+            edgecolor="none", label="Quality usage (question time)")
+    ax.barh(y, g["avg_gap"], left=g["avg_quality"], color=COLORS["danger"],
+            height=0.62, edgecolor="none", alpha=0.85, label="Gap (non-question time)")
+
+    ax.set_yticks(y)
+    # student count on the label keeps a 1-student group from reading like a trend
+    ax.set_yticklabels([f"{r.label}  (n={int(r.students):,})" for r in g.itertuples()],
+                       fontsize=9)
+    ax.set_xlabel("Minutes per engaged student (cumulative)")
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.4)
+    ax.legend(loc="lower right", frameon=True, fontsize=9)
+
+    span = float(g["avg_total"].max()) or 1.0
+    ax.set_xlim(0, span * 1.22)
+    for i, r in g.iterrows():
+        ax.text(r["avg_total"] + span * 0.012, i,
+                f"{r['quality_pct']:.0f}% quality  ·  gap {r['avg_gap']:.0f}m",
+                va="center", fontsize=8.5, color=COLORS["primary"])
+
+    fig.tight_layout(pad=2)
+    return fig_to_base64(fig)
+
+
+def chart_usage_gap_state(df):
+    return chart_usage_gap(df, "state",
+                           "State-wise Total vs Quality Usage Gap")
+
+
+def chart_usage_gap_project(df):
+    return chart_usage_gap(df, "Project Name",
+                           "Project-wise Total vs Quality Usage Gap")
 
 
 def chart_engagement_segments(df):
@@ -1886,6 +2288,8 @@ def build_html_report_current_only(df, report_date, output_path):
     chart_scatter          = chart_proficiency_vs_usage(df)
     chart_district_heatmap = chart_district_subject_heatmap(df)
     chart_top_schools      = chart_top_active_schools(df)
+    chart_gap_state        = chart_usage_gap_state(df)
+    chart_gap_project      = chart_usage_gap_project(df)
 
     chart1 = chart_district_usage(df)
     chart2 = chart_subject_breakdown(df)
@@ -2011,7 +2415,7 @@ function dlSection(btn, name) {{
   <h1>📊 EdTech Weekly Snapshot<span class="badge">CURRENT WEEK ONLY</span></h1>
   <p>Report Date: <strong>{report_date}</strong> &nbsp;|&nbsp;
      Data: <strong>{len(df):,} students</strong> across
-     <strong>{df["s.name"].nunique()} schools</strong> &amp;
+     <strong>{count_schools(df):,} schools</strong> &amp;
      <strong>{df["district"].nunique()} districts</strong>
      &nbsp;|&nbsp; ▸ Single-week insights mode (no WoW comparison)
   </p>
@@ -2034,7 +2438,11 @@ function dlSection(btn, name) {{
                 is_bad=kpis["inactive_students"] > kpis["total_students"] * 0.4)}
       {kpi_card("Avg Weekly Usage",  kpis["avg_weekly_usage"],  suffix=" min")}
       {kpi_card("Avg Total Usage",   kpis["avg_total_usage"],   suffix=" min")}
-      {kpi_card("Schools",           kpis["schools"])}
+      {kpi_card("Avg Quality Usage", kpis.get("avg_quality_usage", 0), suffix=" min",
+                note="Question-level time / engaged student") if "avg_quality_usage" in kpis else ""}
+      {kpi_card("Usage Gap", kpis.get("avg_usage_gap", 0), suffix=" min", is_bad=True,
+                note=f"{kpis.get('quality_pct', 0)}% of session time is quality") if "avg_usage_gap" in kpis else ""}
+      {kpi_card("Schools Covered",   kpis["schools"])}
       {kpi_card("Districts",         kpis["districts"])}
       {kpi_card("Projects",          kpis["projects"])}
     </div>
@@ -2075,6 +2483,27 @@ function dlSection(btn, name) {{
       <button class="dl-btn" onclick="dlSection(this,'Usage_Distribution')">⬇ Save as JPG</button>
     </div>
     {wrap_chart_html(chart_usage_hist, 'usage_distribution.jpg')}
+  </div>
+
+  <div class="section full">
+    <div class="section-hdr">
+      <h2>⏱️ Total vs Quality Usage Gap — by State</h2>
+      <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_State')">⬇ Save as JPG</button>
+    </div>
+    <div style="font-size:13px;color:{COLORS['muted']};margin-bottom:10px">
+      <b>Total Usage</b> is session time (how long the student was inside the app).
+      <b>Quality Usage</b> is question-level time (time actually spent attempting questions).
+      The red band is the gap — logged-in time that did not convert into practice.
+    </div>
+    {wrap_chart_html(chart_gap_state, 'usage_gap_state.jpg')}
+  </div>
+
+  <div class="section full">
+    <div class="section-hdr">
+      <h2>📁 Total vs Quality Usage Gap — by Project</h2>
+      <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_Project')">⬇ Save as JPG</button>
+    </div>
+    {wrap_chart_html(chart_gap_project, 'usage_gap_project.jpg')}
   </div>
 
   <!-- District + Subject side-by-side -->
@@ -2240,7 +2669,12 @@ def export_excel_summary_current_only(df, kpis, flags, insights, report_date, ou
         ("Activation Rate (%)",    kpis["activation_rate"],   "Active / Total"),
         ("Avg Weekly Usage (min)", kpis["avg_weekly_usage"],  "Across all students"),
         ("Avg Total Usage (min)",  kpis["avg_total_usage"],   "Cumulative since start"),
-        ("Schools Covered",        kpis["schools"],           ""),
+    ] + ([
+        ("Avg Quality Usage (min)", kpis["avg_quality_usage"], "Question-level time per engaged student"),
+        ("Avg Usage Gap (min)",     kpis["avg_usage_gap"],     "Total − Quality: non-question time"),
+        ("Quality Share (%)",       kpis["quality_pct"],       "Quality / Total minutes — target 40%+"),
+    ] if "avg_quality_usage" in kpis else []) + [
+        ("Schools Covered",        kpis["schools"],           "Distinct schoolCode values"),
         ("Districts Covered",      kpis["districts"],         ""),
         ("Projects",               kpis["projects"],          ""),
     ]
@@ -2296,7 +2730,7 @@ def export_excel_summary_current_only(df, kpis, flags, insights, report_date, ou
     for i, f in enumerate(flags):
         ws4.append([f["level"].upper(),
                     f["title"].replace("🚨", "").replace("⚠️", "").replace("📉", "")
-                    .replace("👥", "").replace("ℹ️", "").strip(),
+                    .replace("👥", "").replace("ℹ️", "").replace("⏱️", "").strip(),
                     f["detail"]])
         r = 4 + i; body_row(ws4, r, 3)
         ws4.cell(r, 1).fill = level_fill.get(f["level"], A_FILL)
@@ -2395,6 +2829,14 @@ def export_excel_summary_current_only(df, kpis, flags, insights, report_date, ou
         ws7.cell(r, 1).alignment = LFT
     auto_width(ws7)
 
+    _gap_styles = {
+        "hdr": hdr, "body_row": body_row, "title_cell": title_cell,
+        "auto_width": auto_width, "G_FILL": G_FILL, "R_FILL": R_FILL,
+        "W_FILL": W_FILL, "SUB_FONT": SUB_FONT, "LFT": LFT,
+        "TITLE_FILL": PatternFill("solid", fgColor="F0F4F8"),
+    }
+    _write_usage_gap_sheet(wb, df, report_date, _gap_styles)
+
     # Sheet 8: Email Body
     ws8 = wb.create_sheet("Email Body")
     mail = generate_mail_body(kpis, None, flags, df, report_date)
@@ -2476,6 +2918,11 @@ Examples:
     print("\n📂 Loading data...")
     curr_df = load_data(args.current)
     print(f"   ✅ Current: {len(curr_df)} students")
+    # Record full-file coverage BEFORE any week-on-week matching narrows it,
+    # so the report can show total schools alongside WoW-matched schools.
+    set_full_coverage(curr_df)
+    print(f"   ✅ Coverage: {FULL_COVERAGE['schools']} schools (by schoolCode), "
+          f"{FULL_COVERAGE['districts']} districts")
     prev_df = None
     if args.previous and mode == "compare":
         prev_df = load_data(args.previous)
