@@ -140,9 +140,38 @@ def generate_demo_data(curr_path, prev_path=None):
                     "Math Precise Level": math_lvl,
                 })
                 
+    # State, project, Question Solving Time ("Quality Usage") and Session Time
+    # ("Session Usage") — drawn from a SEPARATE random stream so every value
+    # above stays exactly as before.
+    rng = np.random.RandomState(2026)
+    state_of = {"North District": "Demo State North", "South District": "Demo State South",
+                "East District": "Demo State Central", "West District": "Demo State Central"}
+    project_of = {1: "Demo Project 2026", 2: "Demo Project 2026",
+                  3: "Demo Pilot Project", 4: "Demo Home Learning"}
+    solving_share = {"Demo Project 2026": 0.40, "Demo Pilot Project": 0.27,
+                     "Demo Home Learning": 0.55}
+    for row in data:
+        row["state"] = state_of[row["district"]]
+        row["Project Name"] = project_of[int(row["s.name"].rsplit(" ", 1)[-1])]
+        login = float(row["Total Usage"])
+        if login <= 0:
+            row["Quality Usage"] = 0.0
+            row["Session Usage"] = 0.0
+            continue
+        session = login * rng.uniform(1.0, 1.25)
+        share = float(np.clip(solving_share[row["Project Name"]] + rng.normal(0, 0.08), 0.05, 0.9))
+        solving = session * share
+        u = rng.uniform()
+        if u < 0.04:        # broken session end time → Session Time 0
+            session = 0.0
+        elif u < 0.07:      # solving time from attempts exceeds the session window
+            solving = session * rng.uniform(1.0, 1.15)
+        row["Quality Usage"] = round(solving, 2)
+        row["Session Usage"] = round(session, 2)
+
     curr_df = pd.DataFrame(data)
     curr_df.to_excel(curr_path, index=False)
-    
+
     if prev_path:
         prev_data = []
         for row in data:
@@ -153,7 +182,11 @@ def generate_demo_data(curr_path, prev_path=None):
             prev_row["Weekly Usage"] = prev_row["Language_weekly"] + prev_row["English_weekly"] + prev_row["Math_weekly"] + prev_row["CT_Weekly"]
             prev_row["Total Usage"] -= row["Weekly Usage"]
             prev_row["Total Usage"] = max(0, prev_row["Total Usage"])
-            
+            # cumulative solving / session minutes shrink with last week's login time
+            ratio = prev_row["Total Usage"] / row["Total Usage"] if row["Total Usage"] else 0
+            prev_row["Quality Usage"] = round(row["Quality Usage"] * ratio, 2)
+            prev_row["Session Usage"] = round(row["Session Usage"] * ratio, 2)
+
             prev_row["Lang PreciseLevel"] = max(0, row["Lang PreciseLevel"] - np.random.uniform(0, 0.2))
             prev_row["English PreciseLevel"] = max(0, row["English PreciseLevel"] - np.random.uniform(0, 0.2))
             prev_row["Math Precise Level"] = max(0, row["Math Precise Level"] - np.random.uniform(0, 0.2))
@@ -212,12 +245,16 @@ def resolve_school_identity(df):
     return df
 
 
-# ─── Total vs Quality Usage ──────────────────────────────────────────────────
-# "Total Usage"   = session time — how long the student sat inside the app.
-# "Quality Usage" = question-level time — time actually spent attempting questions.
-# The difference between the two is idle / non-question time: navigation, videos,
-# menus, or a session left open. A small gap means a focused learner; a large gap
-# means logged-in time is not converting into practice.
+# ─── Total Usage (login time) vs Question Solving Time ───────────────────────
+# "Total Usage"   = login time — sum of loginTime per session (sessions of 5401 s
+#                   or more excluded), in minutes. This is the usage number we share.
+# "Quality Usage" = Question Solving Time — sum of timeTakenToAnswer, i.e. time
+#                   actually spent answering questions.
+# The difference between the two is login time that was not spent on questions:
+# reading, videos, menus, or the app left open. A small gap means a focused
+# learner; a large gap means login time is not turning into question solving.
+# Column names stay as they are in the input file; only the labels people read
+# in the report use "Total Usage (login time)" and "Question Solving Time".
 
 QUALITY_COL = "Quality Usage"
 
@@ -304,18 +341,203 @@ def overall_quality_stats(df):
     }
 
 
+# ─── Question Solving Time vs Session Time (Start to End) ────────────────────
+# "Session Usage" = Session Time (Start to End): sum of (session end − session
+#   start) over the same sessions as Total Usage, in minutes. It is NOT login
+#   time: sessions with a missing or broken end time (blank / 1970 date, end
+#   before start, longer than 24 h) count as 0, so for some students Session
+#   Time is lower than Total Usage.
+# Question Solving Time (the "Quality Usage" column) comes from question
+#   attempts in the same date window and is not tied to the same sessions, so
+#   for a few students it is higher than Session Time.
+#
+# Rules for this comparison (the existing Usage Gap analysis is untouched):
+#   • uses the UNCAPPED Question Solving Time — load_data saves it in
+#     QST_RAW_COL before prepare_quality_usage caps it at Total Usage;
+#   • population = students with Session Time > 0 ("students who used the app");
+#     students with Session Time = 0 but Question Solving Time > 0 are left out
+#     (broken session end times) and counted in the data note;
+#   • each student's Question Solving Time is capped at their Session Time, so
+#     Other Time in Session (Session − Solving) is never negative;
+#   • group % = summed solving ÷ summed session minutes (not a mean of ratios);
+#     averages are per student who used the app.
+# Labels people read: "Session Time (Start to End)", "Question Solving Time",
+# "Other Time in Session", "% of Session Time Solving Questions" ("% Solving").
+
+SESSION_COL = "Session Usage"
+QST_RAW_COL = "_qst_raw"          # uncapped Quality Usage, saved in load_data
+SOLVING_MIN_GROUP = 30            # min students for a group to count in insights
+SOLVING_NOTE = (
+    "Session Time (Start to End) = how long each session lasted, from start to end, "
+    "added up. Question Solving Time = time actually spent answering questions. "
+    "Other Time in Session = Session Time minus Question Solving Time (reading, "
+    "videos, moving between screens, or app left open). % Solving = Question Solving "
+    "Time ÷ Session Time. Averages are per student who used the app (Session Time > 0). "
+    "This is different from Total Usage, which is login time."
+)
+
+
+def _qst_raw_series(df):
+    """Uncapped Question Solving Time (falls back to the Quality Usage column)."""
+    col = QST_RAW_COL if QST_RAW_COL in df.columns else QUALITY_COL
+    return pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0)
+
+
+def has_session_usage(df):
+    """True only if the file carries usable Session Usage and Quality Usage data.
+
+    Older files have no Session Usage column, and until the Redash query is
+    updated it is present but all 0 — in both cases the analysis is skipped.
+    """
+    if df is None or SESSION_COL not in df.columns:
+        return False
+    if QST_RAW_COL not in df.columns and QUALITY_COL not in df.columns:
+        return False
+    return bool(
+        pd.to_numeric(df[SESSION_COL], errors="coerce").fillna(0).sum() > 0
+        and _qst_raw_series(df).sum() > 0
+    )
+
+
+def _session_solving_base(df, key=None):
+    """One row per student who used the app, with capped solving and other time."""
+    session = pd.to_numeric(df[SESSION_COL], errors="coerce").fillna(0)
+    qst = _qst_raw_series(df)
+    used = session > 0
+    base = pd.DataFrame({"session": session[used], "qst_raw": qst[used]})
+    base["solving"] = base[["qst_raw", "session"]].min(axis=1)
+    base["other"] = base["session"] - base["solving"]
+    base["capped"] = (base["qst_raw"] > base["session"]).astype(int)
+    if key is not None:
+        base["label"] = df.loc[used, key]
+    return base
+
+
+def session_solving_summary(df, key):
+    """Aggregate Question Solving Time vs Session Time by any grouping column.
+
+    Returns one row per group, best % Solving first (same convention as
+    usage_gap_summary). The % is computed on summed minutes.
+    """
+    if not has_session_usage(df) or key not in df.columns:
+        return pd.DataFrame()
+
+    base = _session_solving_base(df, key)
+    if base.empty:
+        return pd.DataFrame()
+
+    g = base.groupby("label", dropna=False).agg(
+        students=("session", "size"),
+        session_min=("session", "sum"),
+        solving_min=("solving", "sum"),
+        other_min=("other", "sum"),
+        capped=("capped", "sum"),
+    ).reset_index()
+    g["label"] = g["label"].fillna("Unspecified").astype(str)
+
+    g["avg_session"] = (g["session_min"] / g["students"]).round(1)
+    g["avg_solving"] = (g["solving_min"] / g["students"]).round(1)
+    g["avg_other"]   = (g["other_min"]   / g["students"]).round(1)
+    g["solving_pct"] = (g["solving_min"] / g["session_min"].replace(0, np.nan) * 100).round(1).fillna(0)
+    g["other_pct"]   = (100 - g["solving_pct"]).round(1)
+    return g.sort_values("solving_pct", ascending=False).reset_index(drop=True)
+
+
+def overall_session_solving_stats(df):
+    """Headline Question Solving Time vs Session Time numbers, plus data-note counts."""
+    if not has_session_usage(df):
+        return None
+
+    session = pd.to_numeric(df[SESSION_COL], errors="coerce").fillna(0)
+    qst = _qst_raw_series(df)
+    used = session > 0
+    n = int(used.sum())
+    if n == 0:
+        return None
+
+    session_min = float(session[used].sum())
+    solving_min = float(np.minimum(qst[used], session[used]).sum())
+    other_min = session_min - solving_min
+    return {
+        "total_students": int(len(df)),
+        "used_students": n,
+        # Session Time 0 but solving time > 0 → broken session end times, left out
+        "left_out": int(((~used) & (qst > 0)).sum()),
+        "no_time": int(((~used) & (qst <= 0)).sum()),
+        "capped": int((qst[used] > session[used]).sum()),
+        "capped_min": float((qst[used] - session[used]).clip(lower=0).sum()),
+        "session_min": session_min,
+        "solving_min": solving_min,
+        "other_min": other_min,
+        "avg_session": round(session_min / n, 1),
+        "avg_solving": round(solving_min / n, 1),
+        "avg_other": round(other_min / n, 1),
+        "solving_pct": round(solving_min / session_min * 100, 1) if session_min else 0.0,
+        "other_pct": round(other_min / session_min * 100, 1) if session_min else 0.0,
+    }
+
+
+def session_solving_data_note(s):
+    """Plain-language data note: who was left out, who was capped, how it adds up."""
+    return (
+        f"Data note: {s['left_out']:,} student(s) left out because their Session Time is 0 "
+        f"but Question Solving Time is more than 0 (session end time missing or broken). "
+        f"{s['capped']:,} student(s) had more Question Solving Time than Session Time; for "
+        f"this comparison their Question Solving Time is counted as equal to their Session "
+        f"Time ({s['capped_min']:,.0f} min trimmed in total). Students in this report: "
+        f"{s['total_students']:,} = {s['used_students']:,} used the app + {s['left_out']:,} "
+        f"left out + {s['no_time']:,} with no Session Time and no Question Solving Time."
+    )
+
+
+def session_solving_insights(df):
+    """Best / worst state and project by % Solving (groups with 30+ students)."""
+    out = []
+    if not has_session_usage(df):
+        return out
+    for key, noun, title in [
+        ("state", "states", "⏱️ Question Solving Time vs Session Time — by State"),
+        ("Project Name", "projects", "📁 Question Solving Time vs Session Time — by Project"),
+    ]:
+        g = session_solving_summary(df, key)
+        if g.empty:
+            continue
+        g = g[g["students"] >= SOLVING_MIN_GROUP]
+        if len(g) < 2:
+            continue
+        best, worst = g.iloc[0], g.iloc[-1]
+        out.append({
+            "title": title,
+            "detail": (f"Highest: '{best['label']}' — {best['solving_pct']:.1f}% of Session Time spent "
+                       f"solving questions (avg {best['avg_solving']:.0f} of {best['avg_session']:.0f} min "
+                       f"per student, n={int(best['students']):,}). "
+                       f"Lowest: '{worst['label']}' — {worst['solving_pct']:.1f}% "
+                       f"(avg {worst['avg_solving']:.0f} of {worst['avg_session']:.0f} min per student, "
+                       f"n={int(worst['students']):,}). "
+                       f"Only {noun} with {SOLVING_MIN_GROUP}+ students who used the app are compared."),
+            "level": "info",
+        })
+    return out
+
+
 def load_data(path):
     df = pd.read_excel(path)
     df.columns = df.columns.str.strip()
     # Normalize numeric cols
     num_cols = ["Language", "english", "Math", "FLN", "CT",
-                "Total Usage", "Quality Usage", "Language_weekly", "English_weekly",
+                "Total Usage", "Quality Usage", "Session Usage",
+                "Language_weekly", "English_weekly",
                 "Math_weekly", "CT_Weekly", "Weekly Usage",
                 "Lang PreciseLevel", "English PreciseLevel", "Math Precise Level"]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df = resolve_school_identity(df)
+    if QUALITY_COL in df.columns:
+        # Keep the UNCAPPED Question Solving Time: prepare_quality_usage caps
+        # Quality Usage at Total Usage in place (for the Usage Gap analysis), but
+        # the Session Time comparison must use the raw value.
+        df[QST_RAW_COL] = df[QUALITY_COL].copy()
     df = prepare_quality_usage(df)
     return df
 
@@ -405,6 +627,9 @@ def compute_kpis(df):
         kpis["avg_quality_usage"] = q["avg_quality"]
         kpis["avg_usage_gap"]     = q["avg_gap"]
         kpis["quality_pct"]       = q["quality_pct"]
+    s = overall_session_solving_stats(df)
+    if s:
+        kpis["solving_pct"] = s["solving_pct"]   # % of Session Time solving questions
     return kpis
 
 
@@ -462,15 +687,15 @@ def find_red_flags(df, prev_df=None):
             "detail": f"{low_math} students ({low_math/len(df)*100:.1f}%) are below Level 3 in Math. Needs targeted intervention.",
         })
 
-    # Session time that never turns into question attempts
+    # Login time that never turns into question solving
     q = overall_quality_stats(df)
     if q and q["quality_pct"] < 40:
         flags.append({
             "level": "critical" if q["quality_pct"] < 25 else "warning",
-            "title": "⏱️ Low Quality-Usage Share",
-            "detail": (f"Only {q['quality_pct']:.1f}% of session time is question-level (quality) usage — "
-                       f"{q['avg_gap']:.0f} of every {q['avg_total']:.0f} min per engaged student is "
-                       f"non-question time. Target is 40%+."),
+            "title": "⏱️ Low Question Solving Share",
+            "detail": (f"Only {q['quality_pct']:.1f}% of login time (Total Usage) is spent solving questions — "
+                       f"{q['avg_gap']:.0f} of every {q['avg_total']:.0f} min of login time per engaged "
+                       f"student is not Question Solving Time. Target is 40%+."),
         })
 
     # WoW drops (if prev data)
@@ -955,11 +1180,20 @@ def generate_mail_body(kpis, deltas, flags, df, report_date):
     quality_lines = ""
     if q_stats:
         quality_lines = (
-            f"\n• Avg Quality Usage         : {q_stats['avg_quality']:.0f} min "
-            f"(question-level time)\n"
-            f"• Total ↔ Quality Gap       : {q_stats['avg_gap']:.0f} min per engaged student "
-            f"— only {q_stats['quality_pct']:.1f}% of session time is question time\n"
+            f"\n• Avg Question Solving Time : {q_stats['avg_quality']:.0f} min "
+            f"(time spent answering questions)\n"
+            f"• Login ↔ Solving Gap       : {q_stats['avg_gap']:.0f} min per engaged student "
+            f"— only {q_stats['quality_pct']:.1f}% of login time is spent solving questions\n"
         )
+
+    s_stats = overall_session_solving_stats(df)
+    if s_stats:
+        session_line = (
+            f"• Question Solving Time vs Session Time: {s_stats['solving_pct']:.1f}% of session time "
+            f"spent solving questions (avg {s_stats['avg_solving']:.0f} min of "
+            f"{s_stats['avg_session']:.0f} min per student)\n"
+        )
+        quality_lines = (quality_lines or "\n") + session_line
 
     top_schools = "\n".join(
         f"  {i+1}. {r['s.name']}: {r['weekly']:.0f} min/week ({r['activation']:.0f}% active)"
@@ -1123,9 +1357,15 @@ def build_html_report(curr_df, prev_df, report_date, output_path):
     chart_dist_wow   = chart_district_wow(curr_df, prev_df)   if _has_prev else None
     chart_gap_state   = chart_usage_gap_state(curr_df)
     chart_gap_project = chart_usage_gap_project(curr_df)
+    session_solving_sections = session_solving_sections_html(curr_df)
 
     def d(key):
         return deltas.get(key) if deltas else None
+
+    # WoW delta for the new % only when BOTH weeks carry Session Time data —
+    # compute_delta would otherwise report a misleading 0 change.
+    solving_delta = (d("solving_pct")
+                     if prev_kpis and "solving_pct" in prev_kpis else None)
 
     def wrap_chart_html(chart_base64, filename="chart.jpg"):
         if not chart_base64: return ""
@@ -1339,11 +1579,14 @@ function dlSection(btn, name) {{
                 -d("inactive_students") if d("inactive_students") else None,
                 is_bad=kpis["inactive_students"] > kpis["total_students"] * 0.4)}
       {kpi_card("Avg Weekly Usage",  kpis["avg_weekly_usage"],  d("avg_weekly_usage"),  suffix=" min")}
-      {kpi_card("Avg Total Usage",   kpis["avg_total_usage"],   d("avg_total_usage"),   suffix=" min")}
-      {kpi_card("Avg Quality Usage", kpis.get("avg_quality_usage", 0), d("avg_quality_usage"), suffix=" min",
-                note="Question-level time / engaged student") if "avg_quality_usage" in kpis else ""}
+      {kpi_card("Avg Total Usage",   kpis["avg_total_usage"],   d("avg_total_usage"),   suffix=" min",
+                note="Login time")}
+      {kpi_card("Avg Question Solving Time", kpis.get("avg_quality_usage", 0), d("avg_quality_usage"), suffix=" min",
+                note="Time answering questions / engaged student") if "avg_quality_usage" in kpis else ""}
       {kpi_card("Usage Gap", kpis.get("avg_usage_gap", 0), d("avg_usage_gap"), suffix=" min", is_bad=True,
-                note=f"{kpis.get('quality_pct', 0)}% of session time is quality") if "avg_usage_gap" in kpis else ""}
+                note=f"{kpis.get('quality_pct', 0)}% of login time is spent solving questions") if "avg_usage_gap" in kpis else ""}
+      {kpi_card("Time Solving Questions", kpis.get("solving_pct", 0), solving_delta, suffix="%",
+                note="of Session Time (Start to End)") if "solving_pct" in kpis else ""}
       {kpi_card("Schools Covered",   kpis["schools_total"],
                 note=(f'{kpis["schools"]:,} with matched WoW data'
                       if kpis["schools_total"] != kpis["schools"] else ""))}
@@ -1375,24 +1618,26 @@ function dlSection(btn, name) {{
 
   <div class="section full">
     <div class="section-hdr">
-      <h2>⏱️ Total vs Quality Usage Gap — by State</h2>
+      <h2>⏱️ Total Usage (login time) vs Question Solving Time Gap — by State</h2>
       <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_State')">⬇ Save as JPG</button>
     </div>
     <div style="font-size:13px;color:{COLORS['muted']};margin-bottom:10px">
-      <b>Total Usage</b> is session time (how long the student was inside the app).
-      <b>Quality Usage</b> is question-level time (time actually spent attempting questions).
-      The red band is the gap — logged-in time that did not convert into practice.
+      <b>Total Usage</b> is login time (how long the student was logged in to the app).
+      <b>Question Solving Time</b> is the time actually spent answering questions.
+      The red band is the gap — login time that did not turn into question solving.
     </div>
     {wrap_chart_html(chart_gap_state, 'usage_gap_state.jpg')}
   </div>
 
   <div class="section full">
     <div class="section-hdr">
-      <h2>📁 Total vs Quality Usage Gap — by Project</h2>
+      <h2>📁 Total Usage (login time) vs Question Solving Time Gap — by Project</h2>
       <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_Project')">⬇ Save as JPG</button>
     </div>
     {wrap_chart_html(chart_gap_project, 'usage_gap_project.jpg')}
   </div>
+
+  {session_solving_sections}
 
   {dist_wow_section}
 
@@ -1458,13 +1703,14 @@ def _write_usage_gap_sheet(wb, df, report_date, styles):
         styles["SUB_FONT"], styles["LFT"])
 
     ws = wb.create_sheet("Usage Quality Gap")
-    title_cell(ws, 1, 1, f"Total vs Quality Usage Gap — {report_date}", span_to=8)
+    title_cell(ws, 1, 1, f"Total Usage (login time) vs Question Solving Time Gap — {report_date}",
+               span_to=8)
     ws.append([])
 
-    note = ("Total Usage = session time in the app. Quality Usage = question-level time "
-            "(time actually spent attempting questions). Gap = Total − Quality, i.e. "
-            "logged-in time that did not convert into practice. Averages are per engaged "
-            "student (Total Usage > 0); % figures are computed on summed minutes.")
+    note = ("Total Usage = login time in the app. Question Solving Time = time actually spent "
+            "answering questions. Gap = Total Usage − Question Solving Time, i.e. login time "
+            "that did not turn into question solving. Averages are per engaged student "
+            "(Total Usage > 0); % figures are computed on summed minutes.")
     ws.cell(2, 1, note).alignment = LFT
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
     ws.row_dimensions[2].height = 46
@@ -1472,10 +1718,10 @@ def _write_usage_gap_sheet(wb, df, report_date, styles):
     overall = overall_quality_stats(df)
     if overall:
         ws.append(["Overall", f"{overall['engaged_students']:,} engaged students",
-                   f"Avg Total {overall['avg_total']:.1f} min",
-                   f"Avg Quality {overall['avg_quality']:.1f} min",
+                   f"Avg Total Usage (login) {overall['avg_total']:.1f} min",
+                   f"Avg Question Solving {overall['avg_quality']:.1f} min",
                    f"Avg Gap {overall['avg_gap']:.1f} min",
-                   f"Quality Share {overall['quality_pct']:.1f}%",
+                   f"Solving Share {overall['quality_pct']:.1f}%",
                    f"Gap Share {overall['gap_pct']:.1f}%", ""])
         r = ws.max_row
         body_row(ws, r, 8)
@@ -1485,8 +1731,9 @@ def _write_usage_gap_sheet(wb, df, report_date, styles):
             ws.cell(r, c).alignment = LFT
         ws.append([])
 
-    cols = ["Name", "Engaged Students", "Avg Total Usage (min)", "Avg Quality Usage (min)",
-            "Avg Gap (min)", "Quality Share %", "Gap Share %", "Total Gap (student-hours)"]
+    cols = ["Name", "Engaged Students", "Avg Total Usage – login time (min)",
+            "Avg Question Solving Time (min)", "Avg Gap (min)",
+            "Solving Share % (of login time)", "Gap Share %", "Total Gap (student-hours)"]
 
     for label, key in [("🗺️ State-wise Usage Gap", "state"),
                        ("📁 Project-wise Usage Gap", "Project Name")]:
@@ -1514,6 +1761,168 @@ def _write_usage_gap_sheet(wb, df, report_date, styles):
 
     auto_width(ws, mn=12, mx=44)
     return ws
+
+
+def _write_session_solving_sheet(wb, df, report_date, styles):
+    """Add a 'Solving vs Session Time' sheet: overall, state-wise and project-wise
+    Question Solving Time vs Session Time (Start to End), each block with a native
+    clustered bar chart to its right. Skipped silently without Session Time data.
+    """
+    if not has_session_usage(df):
+        return None
+    overall = overall_session_solving_stats(df)
+    if not overall:
+        return None
+
+    import math
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.styles import Font
+
+    hdr, body_row, title_cell, auto_width = (
+        styles["hdr"], styles["body_row"], styles["title_cell"], styles["auto_width"])
+    G_FILL, R_FILL, W_FILL, SUB_FONT, LFT = (
+        styles["G_FILL"], styles["R_FILL"], styles["W_FILL"],
+        styles["SUB_FONT"], styles["LFT"])
+    NCOLS = 8
+
+    ws = wb.create_sheet("Solving vs Session Time")
+    title_cell(ws, 1, 1,
+               f"Question Solving Time vs Session Time (Start to End) — {report_date}",
+               span_to=NCOLS)
+
+    # Row 2: plain-language note
+    ws.cell(2, 1, SOLVING_NOTE).alignment = LFT
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
+    ws.row_dimensions[2].height = 62
+
+    # Row 3: data note (left out / capped / how the counts add up)
+    c = ws.cell(3, 1, session_solving_data_note(overall))
+    c.alignment = LFT
+    c.font = Font(name="Segoe UI", size=9, italic=True, color="5D6D7E")
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=NCOLS)
+    ws.row_dimensions[3].height = 48
+
+    # Row 4: overall
+    ws.append(["Overall",
+               f"{overall['used_students']:,} students used the app",
+               f"Avg Session Time {overall['avg_session']:.1f} min",
+               f"Avg Question Solving Time {overall['avg_solving']:.1f} min",
+               f"Avg Other Time in Session {overall['avg_other']:.1f} min",
+               f"% Solving {overall['solving_pct']:.1f}%",
+               f"Total Session Time {overall['session_min'] / 60:,.1f} hrs",
+               f"Total Question Solving Time {overall['solving_min'] / 60:,.1f} hrs"])
+    r = ws.max_row
+    body_row(ws, r, NCOLS)
+    ws.cell(r, 1).font = SUB_FONT
+    for col in range(1, NCOLS + 1):
+        ws.cell(r, col).fill = W_FILL
+        ws.cell(r, col).alignment = LFT
+    ws.row_dimensions[r].height = 46
+
+    cols = ["Name", "Students (used app)", "Avg Session Time (min)",
+            "Avg Question Solving Time (min)", "Avg Other Time in Session (min)",
+            "% of Session Time Solving Questions", "Total Session Time (hrs)",
+            "Total Question Solving Time (hrs)"]
+
+    NUM_FMT = ["General", "#,##0", "0.0", "0.0", "0.0", "0.0", "#,##0.0", "#,##0.0"]
+
+    row = r + 2                       # one blank row after the overall row
+    for label, key, scope in [("🗺️ State-wise", "state", "State-wise"),
+                              ("📁 Project-wise", "Project Name", "Project-wise")]:
+        g = session_solving_summary(df, key)
+        if g.empty:
+            continue
+        # lowest % first — that is where follow-up is needed
+        g = g.sort_values("solving_pct", kind="mergesort").reset_index(drop=True)
+
+        block_top = row
+        ws.cell(row, 1, label).font = SUB_FONT
+        ws.cell(row, 1).fill = styles["TITLE_FILL"]
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NCOLS)
+        row += 1
+
+        hdr_row = row
+        for ci, name in enumerate(cols, 1):
+            ws.cell(row, ci, name)
+        hdr(ws, row, NCOLS)
+        ws.row_dimensions[row].height = 45
+        row += 1
+
+        for i, rec in g.iterrows():
+            values = [rec["label"], int(rec["students"]), rec["avg_session"],
+                      rec["avg_solving"], rec["avg_other"], rec["solving_pct"],
+                      round(rec["session_min"] / 60, 1), round(rec["solving_min"] / 60, 1)]
+            for ci, v in enumerate(values, 1):
+                ws.cell(row, ci, v).number_format = NUM_FMT[ci - 1]
+            body_row(ws, row, NCOLS, alt=(i % 2 == 0))
+            ws.cell(row, 1).alignment = LFT
+            ws.cell(row, 6).fill = (G_FILL if rec["solving_pct"] >= 50 else
+                                    W_FILL if rec["solving_pct"] >= 30 else R_FILL)
+            row += 1
+        last_row = row - 1
+
+        # Native clustered bar chart (works in Excel and in the browser build)
+        n = len(g)
+        ch = BarChart()
+        ch.type = "bar"
+        ch.grouping = "clustered"
+        ch.title = _chart_title(f"{scope}: Avg Session Time vs Avg Question Solving Time")
+        ch.y_axis.title = "Minutes per student who used the app"
+        ch.x_axis.title = None
+        data = Reference(ws, min_col=3, max_col=4, min_row=hdr_row, max_row=last_row)
+        cats = Reference(ws, min_col=1, min_row=hdr_row + 1, max_row=last_row)
+        ch.add_data(data, titles_from_data=True)
+        ch.set_categories(cats)
+        ch.series[0].graphicalProperties.solidFill = "AAB7B8"   # Session Time (muted)
+        ch.series[0].graphicalProperties.line.noFill = True
+        ch.series[1].graphicalProperties.solidFill = "27AE60"   # Question Solving Time
+        ch.series[1].graphicalProperties.line.noFill = True
+        ch.gapWidth = 60
+        ch.legend.position = "b"
+        # same top-to-bottom order as the table beside it (lowest % at the top)
+        ch.x_axis.scaling.orientation = "maxMin"
+        ch.y_axis.crosses = "max"
+        ch.x_axis.delete = False
+        ch.y_axis.delete = False
+        ch.y_axis.majorGridlines = None
+        ch.y_axis.number_format = "#,##0"
+        ch.x_axis.tickLblSkip = 1                 # show every group name
+        ch.x_axis.txPr = _chart_text(800)         # 8 pt category labels
+        ch.width = 20
+        ch.height = max(7.5, 0.75 * n + 4)
+        ws.add_chart(ch, f"J{block_top}")
+
+        # keep the next block clear of this chart (default row ≈ 0.53 cm)
+        rows_for_chart = math.ceil(ch.height / 0.53) + 1
+        row = max(row + 1, block_top + rows_for_chart)
+
+    auto_width(ws, mn=12, mx=44)
+    # Keep the numeric columns compact (headers and the overall row wrap) so the
+    # charts to the right of the tables stay close to them.
+    from openpyxl.utils import get_column_letter
+    for col in range(2, NCOLS + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 17
+    ws.column_dimensions["I"].width = 3
+    return ws
+
+
+def _chart_text(size=800):
+    """Axis text properties (font size in 1/100 pt) for openpyxl charts."""
+    from openpyxl.chart.text import RichText
+    from openpyxl.drawing.text import Paragraph, ParagraphProperties, CharacterProperties
+    cp = CharacterProperties(sz=size)
+    return RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=cp), endParaRPr=cp)])
+
+
+def _chart_title(text, size=1200):
+    """Chart title as rich text (12 pt bold, report navy) so long titles fit."""
+    from openpyxl.chart.title import Title
+    from openpyxl.chart.text import Text, RichText
+    from openpyxl.drawing.text import (Paragraph, ParagraphProperties,
+                                       CharacterProperties, RegularTextRun)
+    cp = CharacterProperties(sz=size, b=True, solidFill="1A3A5C")
+    para = Paragraph(pPr=ParagraphProperties(defRPr=cp), r=[RegularTextRun(rPr=cp, t=text)])
+    return Title(tx=Text(rich=RichText(p=[para])), overlay=False)
 
 
 def export_excel_summary(curr_df, prev_df, kpis, deltas, flags, report_date, output_path):
@@ -1763,6 +2172,7 @@ def export_excel_summary(curr_df, prev_df, kpis, deltas, flags, report_date, out
         "TITLE_FILL": PatternFill("solid", fgColor="F0F4F8"),
     }
     _write_usage_gap_sheet(wb, curr_df, report_date, _gap_styles)
+    _write_session_solving_sheet(wb, curr_df, report_date, _gap_styles)
 
     ws6 = wb.create_sheet("Email Body")
     mail = generate_mail_body(kpis, deltas, flags, curr_df, report_date)
@@ -1806,16 +2216,16 @@ def generate_current_week_insights(df):
         "level": "info",
     })
 
-    # 1b. Total vs Quality usage gap (session time vs question-level time)
+    # 1b. Total Usage (login time) vs Question Solving Time gap
     q = overall_quality_stats(df)
     if q:
         insights.append({
-            "title": "⏱️ Total vs Quality Usage Gap",
+            "title": "⏱️ Total Usage (login time) vs Question Solving Time Gap",
             "detail": (f"Across {q['engaged_students']:,} engaged students, "
-                       f"{q['avg_total']:.0f} min of session time per student yields only "
-                       f"{q['avg_quality']:.0f} min of question-level (quality) usage — a gap of "
-                       f"{q['avg_gap']:.0f} min ({q['gap_pct']:.1f}% of time in app). "
-                       f"Quality share overall: {q['quality_pct']:.1f}%."),
+                       f"{q['avg_total']:.0f} min of login time per student includes only "
+                       f"{q['avg_quality']:.0f} min of Question Solving Time — a gap of "
+                       f"{q['avg_gap']:.0f} min ({q['gap_pct']:.1f}% of login time). "
+                       f"Solving share overall: {q['quality_pct']:.1f}%."),
             "level": "info",
         })
 
@@ -1825,9 +2235,9 @@ def generate_current_week_insights(df):
             best, worst = st.iloc[0], st.iloc[-1]
             insights.append({
                 "title": "🗺️ Usage Gap by State",
-                "detail": (f"'{best['label']}' converts best — {best['quality_pct']:.1f}% of session time is "
-                           f"question time (gap {best['avg_gap']:.0f} min/student). "
-                           f"'{worst['label']}' converts worst — {worst['quality_pct']:.1f}% quality, "
+                "detail": (f"'{best['label']}' converts best — {best['quality_pct']:.1f}% of login time is "
+                           f"spent solving questions (gap {best['avg_gap']:.0f} min/student). "
+                           f"'{worst['label']}' converts worst — {worst['quality_pct']:.1f}% solving, "
                            f"gap {worst['avg_gap']:.0f} min/student across {int(worst['students']):,} students. "
                            f"Spread: {best['quality_pct'] - worst['quality_pct']:.1f} pp "
                            f"(states with 500+ engaged students)."),
@@ -1841,15 +2251,18 @@ def generate_current_week_insights(df):
             big_gap = pr.nlargest(1, "gap_min").iloc[0]
             insights.append({
                 "title": "📁 Usage Gap by Project",
-                "detail": (f"Best conversion: '{best['label']}' at {best['quality_pct']:.1f}% quality "
+                "detail": (f"Best conversion: '{best['label']}' at {best['quality_pct']:.1f}% solving "
                            f"(gap {best['avg_gap']:.0f} min/student). "
-                           f"Weakest: '{worst['label']}' at {worst['quality_pct']:.1f}% quality "
+                           f"Weakest: '{worst['label']}' at {worst['quality_pct']:.1f}% solving "
                            f"(gap {worst['avg_gap']:.0f} min/student). "
                            f"Largest absolute gap pool: '{big_gap['label']}' with "
-                           f"{big_gap['gap_min']/60:,.0f} student-hours of non-question time "
+                           f"{big_gap['gap_min']/60:,.0f} student-hours of login time not spent on questions "
                            f"(projects with 200+ engaged students)."),
                 "level": "info",
             })
+
+    # 1c. Question Solving Time vs Session Time (Start to End) — best / worst groups
+    insights.extend(session_solving_insights(df))
 
     # 2. Most-engaged subject
     subj_avg = {
@@ -1945,11 +2358,10 @@ def generate_current_week_insights(df):
 
 
 def chart_usage_gap(df, key, title, max_items=18):
-    """Stacked bar: quality (question) minutes vs idle gap minutes per student.
+    """Stacked bar: Question Solving Time vs gap minutes per student.
 
-    Bars are sorted worst-first (lowest quality share at the top) so the groups
-    that need follow-up are read first. The % label is the quality share of
-    session time, i.e. how much of the time in the app became actual practice.
+    Bars are sorted by solving share (lowest share drawn at the bottom). The %
+    label is the share of login time (Total Usage) spent solving questions.
     """
     g = usage_gap_summary(df, key)
     if g.empty:
@@ -1965,9 +2377,10 @@ def chart_usage_gap(df, key, title, max_items=18):
     y = np.arange(n)
 
     ax.barh(y, g["avg_quality"], color=COLORS["success"], height=0.62,
-            edgecolor="none", label="Quality usage (question time)")
+            edgecolor="none", label="Question Solving Time")
     ax.barh(y, g["avg_gap"], left=g["avg_quality"], color=COLORS["danger"],
-            height=0.62, edgecolor="none", alpha=0.85, label="Gap (non-question time)")
+            height=0.62, edgecolor="none", alpha=0.85,
+            label="Gap (login time not spent on questions)")
 
     ax.set_yticks(y)
     # student count on the label keeps a 1-student group from reading like a trend
@@ -1982,7 +2395,7 @@ def chart_usage_gap(df, key, title, max_items=18):
     ax.set_xlim(0, span * 1.22)
     for i, r in g.iterrows():
         ax.text(r["avg_total"] + span * 0.012, i,
-                f"{r['quality_pct']:.0f}% quality  ·  gap {r['avg_gap']:.0f}m",
+                f"{r['quality_pct']:.0f}% solving  ·  gap {r['avg_gap']:.0f}m",
                 va="center", fontsize=8.5, color=COLORS["primary"])
 
     fig.tight_layout(pad=2)
@@ -1991,12 +2404,132 @@ def chart_usage_gap(df, key, title, max_items=18):
 
 def chart_usage_gap_state(df):
     return chart_usage_gap(df, "state",
-                           "State-wise Total vs Quality Usage Gap")
+                           "State-wise Total Usage (login time) vs Question Solving Time Gap")
 
 
 def chart_usage_gap_project(df):
     return chart_usage_gap(df, "Project Name",
-                           "Project-wise Total vs Quality Usage Gap")
+                           "Project-wise Total Usage (login time) vs Question Solving Time Gap")
+
+
+def chart_session_solving(df, key, title, max_items=18):
+    """Stacked bar per group: Question Solving Time + Other Time in Session.
+
+    The full bar is Session Time (Start to End), in minutes per student who used
+    the app. Ordering and trimming follow chart_usage_gap (sorted by % Solving,
+    lowest drawn at the bottom; lowest and highest groups kept when trimming).
+    """
+    g = session_solving_summary(df, key)
+    if g.empty:
+        return None
+
+    n_all = len(g)
+    g = g.sort_values("solving_pct", ascending=True)
+    if len(g) > max_items:
+        g = pd.concat([g.head(max_items // 2), g.tail(max_items - max_items // 2)])
+        title = (f"{title}\n(showing the {max_items // 2} lowest and "
+                 f"{max_items - max_items // 2} highest of {n_all} by % Solving)")
+    g = g.sort_values("solving_pct", ascending=True).reset_index(drop=True)
+
+    # unrounded per-student minutes so solving + other = session exactly
+    avg_session = g["session_min"] / g["students"]
+    avg_solving = g["solving_min"] / g["students"]
+    avg_other = avg_session - avg_solving
+
+    n = len(g)
+    fig, ax = plt.subplots(figsize=(13, max(4.5, 0.46 * n + 2)))
+    y = np.arange(n)
+
+    ax.barh(y, avg_solving, color=COLORS["success"], height=0.62,
+            edgecolor="none", label="Question Solving Time")
+    ax.barh(y, avg_other, left=avg_solving, color=COLORS["muted"], alpha=0.45,
+            height=0.62, edgecolor="none", label="Other Time in Session")
+    ax.barh(y, avg_session, height=0.62, fill=False,
+            edgecolor=COLORS["primary"], linewidth=0.6,
+            label="Full bar = Session Time (Start to End)")
+
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{r.label}  (n={int(r.students):,})" for r in g.itertuples()],
+                       fontsize=9)
+    ax.set_xlabel("Minutes per student who used the app (cumulative)")
+    ax.set_title(title, pad=30)
+    ax.grid(axis="x", alpha=0.4)
+    # legend sits between the title and the bars so it never covers a bar label
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.0), ncol=3, frameon=False,
+              fontsize=9, borderaxespad=0.3)
+
+    span = float(avg_session.max()) or 1.0
+    ax.set_xlim(0, span * 1.28)
+    for i, r in g.iterrows():
+        ax.text(avg_session.iloc[i] + span * 0.012, i,
+                f"{r['solving_pct']:.0f}% solving  ·  session {avg_session.iloc[i]:.0f}m",
+                va="center", fontsize=8.5, color=COLORS["primary"])
+
+    fig.tight_layout(pad=2)
+    return fig_to_base64(fig)
+
+
+def chart_session_solving_state(df):
+    return chart_session_solving(
+        df, "state", "State-wise: Question Solving Time vs Session Time (Start to End)")
+
+
+def chart_session_solving_project(df):
+    return chart_session_solving(
+        df, "Project Name", "Project-wise: Question Solving Time vs Session Time (Start to End)")
+
+
+def session_solving_sections_html(df):
+    """The two full-width HTML sections (by State, by Project), or "" without data."""
+    if not has_session_usage(df):
+        return ""
+    s = overall_session_solving_stats(df)
+    chart_state = chart_session_solving_state(df)
+    chart_project = chart_session_solving_project(df)
+    if not (chart_state or chart_project):
+        return ""
+
+    def img(c, name):
+        return (f'<img src="data:image/jpeg;base64,{c}" '
+                f'style="width:100%;border-radius:8px" id="img_{name}">')
+
+    note_style = f"font-size:13px;color:{COLORS['muted']};margin-bottom:10px"
+    data_note = (f'<div style="font-size:11.5px;color:{COLORS["muted"]};margin:-4px 0 10px">'
+                 f'{s["used_students"]:,} students used the app (Session Time &gt; 0). '
+                 f'{s["left_out"]:,} left out (Session Time 0 but Question Solving Time &gt; 0); '
+                 f'{s["capped"]:,} had Question Solving Time above Session Time and were capped '
+                 f'at their Session Time.</div>') if s else ""
+
+    html = ""
+    if chart_state:
+        html += f"""
+  <div class="section full">
+    <div class="section-hdr">
+      <h2>⏱️ Question Solving Time vs Session Time — by State</h2>
+      <button class="dl-btn" onclick="dlSection(this,'Solving_Session_State')">⬇ Save as JPG</button>
+    </div>
+    <div style="{note_style}">
+      <b>Session Time (Start to End)</b> is how long each session lasted, added up.
+      The green part is <b>Question Solving Time</b>; the grey part is <b>Other Time in Session</b>
+      (reading, videos, moving between screens, or the app left open).
+    </div>
+    {data_note}
+    {img(chart_state, 'solving_session_state')}
+  </div>"""
+    if chart_project:
+        html += f"""
+  <div class="section full">
+    <div class="section-hdr">
+      <h2>📁 Question Solving Time vs Session Time — by Project</h2>
+      <button class="dl-btn" onclick="dlSection(this,'Solving_Session_Project')">⬇ Save as JPG</button>
+    </div>
+    <div style="{note_style}">
+      Same comparison by project: green = Question Solving Time, grey = Other Time in Session,
+      full bar = Session Time (Start to End), per student who used the app.
+    </div>
+    {img(chart_project, 'solving_session_project')}
+  </div>"""
+    return html
 
 
 def chart_engagement_segments(df):
@@ -2290,6 +2823,7 @@ def build_html_report_current_only(df, report_date, output_path):
     chart_top_schools      = chart_top_active_schools(df)
     chart_gap_state        = chart_usage_gap_state(df)
     chart_gap_project      = chart_usage_gap_project(df)
+    session_solving_sections = session_solving_sections_html(df)
 
     chart1 = chart_district_usage(df)
     chart2 = chart_subject_breakdown(df)
@@ -2437,11 +2971,13 @@ function dlSection(btn, name) {{
       {kpi_card("Inactive Students", kpis["inactive_students"],
                 is_bad=kpis["inactive_students"] > kpis["total_students"] * 0.4)}
       {kpi_card("Avg Weekly Usage",  kpis["avg_weekly_usage"],  suffix=" min")}
-      {kpi_card("Avg Total Usage",   kpis["avg_total_usage"],   suffix=" min")}
-      {kpi_card("Avg Quality Usage", kpis.get("avg_quality_usage", 0), suffix=" min",
-                note="Question-level time / engaged student") if "avg_quality_usage" in kpis else ""}
+      {kpi_card("Avg Total Usage",   kpis["avg_total_usage"],   suffix=" min", note="Login time")}
+      {kpi_card("Avg Question Solving Time", kpis.get("avg_quality_usage", 0), suffix=" min",
+                note="Time answering questions / engaged student") if "avg_quality_usage" in kpis else ""}
       {kpi_card("Usage Gap", kpis.get("avg_usage_gap", 0), suffix=" min", is_bad=True,
-                note=f"{kpis.get('quality_pct', 0)}% of session time is quality") if "avg_usage_gap" in kpis else ""}
+                note=f"{kpis.get('quality_pct', 0)}% of login time is spent solving questions") if "avg_usage_gap" in kpis else ""}
+      {kpi_card("Time Solving Questions", kpis.get("solving_pct", 0), suffix="%",
+                note="of Session Time (Start to End)") if "solving_pct" in kpis else ""}
       {kpi_card("Schools Covered",   kpis["schools"])}
       {kpi_card("Districts",         kpis["districts"])}
       {kpi_card("Projects",          kpis["projects"])}
@@ -2487,24 +3023,26 @@ function dlSection(btn, name) {{
 
   <div class="section full">
     <div class="section-hdr">
-      <h2>⏱️ Total vs Quality Usage Gap — by State</h2>
+      <h2>⏱️ Total Usage (login time) vs Question Solving Time Gap — by State</h2>
       <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_State')">⬇ Save as JPG</button>
     </div>
     <div style="font-size:13px;color:{COLORS['muted']};margin-bottom:10px">
-      <b>Total Usage</b> is session time (how long the student was inside the app).
-      <b>Quality Usage</b> is question-level time (time actually spent attempting questions).
-      The red band is the gap — logged-in time that did not convert into practice.
+      <b>Total Usage</b> is login time (how long the student was logged in to the app).
+      <b>Question Solving Time</b> is the time actually spent answering questions.
+      The red band is the gap — login time that did not turn into question solving.
     </div>
     {wrap_chart_html(chart_gap_state, 'usage_gap_state.jpg')}
   </div>
 
   <div class="section full">
     <div class="section-hdr">
-      <h2>📁 Total vs Quality Usage Gap — by Project</h2>
+      <h2>📁 Total Usage (login time) vs Question Solving Time Gap — by Project</h2>
       <button class="dl-btn" onclick="dlSection(this,'Usage_Gap_Project')">⬇ Save as JPG</button>
     </div>
     {wrap_chart_html(chart_gap_project, 'usage_gap_project.jpg')}
   </div>
+
+  {session_solving_sections}
 
   <!-- District + Subject side-by-side -->
   <div class="section">
@@ -2668,11 +3206,14 @@ def export_excel_summary_current_only(df, kpis, flags, insights, report_date, ou
         ("Inactive Students",      kpis["inactive_students"], "Target < 30%"),
         ("Activation Rate (%)",    kpis["activation_rate"],   "Active / Total"),
         ("Avg Weekly Usage (min)", kpis["avg_weekly_usage"],  "Across all students"),
-        ("Avg Total Usage (min)",  kpis["avg_total_usage"],   "Cumulative since start"),
+        ("Avg Total Usage (min)",  kpis["avg_total_usage"],   "Login time, cumulative since start"),
     ] + ([
-        ("Avg Quality Usage (min)", kpis["avg_quality_usage"], "Question-level time per engaged student"),
-        ("Avg Usage Gap (min)",     kpis["avg_usage_gap"],     "Total − Quality: non-question time"),
-        ("Quality Share (%)",       kpis["quality_pct"],       "Quality / Total minutes — target 40%+"),
+        ("Avg Question Solving Time (min)", kpis["avg_quality_usage"],
+         "Time spent answering questions, per engaged student"),
+        ("Avg Usage Gap (min)",     kpis["avg_usage_gap"],
+         "Total Usage (login time) − Question Solving Time: login time not spent on questions"),
+        ("Solving Share of Login Time (%)", kpis["quality_pct"],
+         "Question Solving Time ÷ Total Usage (login time) — target 40%+"),
     ] if "avg_quality_usage" in kpis else []) + [
         ("Schools Covered",        kpis["schools"],           "Distinct schoolCode values"),
         ("Districts Covered",      kpis["districts"],         ""),
@@ -2836,6 +3377,7 @@ def export_excel_summary_current_only(df, kpis, flags, insights, report_date, ou
         "TITLE_FILL": PatternFill("solid", fgColor="F0F4F8"),
     }
     _write_usage_gap_sheet(wb, df, report_date, _gap_styles)
+    _write_session_solving_sheet(wb, df, report_date, _gap_styles)
 
     # Sheet 8: Email Body
     ws8 = wb.create_sheet("Email Body")
